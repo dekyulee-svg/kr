@@ -1,0 +1,38 @@
+# 使用轻量化的 Alpine Linux 作为基础镜像
+FROM alpine:latest
+
+# 安装必要的依赖
+RUN apk update && apk add --no-cache \
+    curl \
+    unzip \
+    bash \
+    nodejs \
+    npm
+
+# 安装 Xray
+RUN curl -L -o xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/xray-linux-64.zip \
+    && unzip xray.zip -d /usr/local/bin \
+    && rm xray.zip \
+    && chmod +x /usr/local/bin/xray
+
+# 安装 subconverter
+RUN curl -L -o subconverter.tar.gz https://github.com/tindy2013/subconverter/releases/latest/download/subconverter_linux64.tar.gz \
+    && tar -xzf subconverter.tar.gz -C /usr/local/bin \
+    && rm subconverter.tar.gz \
+    && chmod +x /usr/local/bin/subconverter
+
+# 复制 Xray 配置文件
+COPY xray-config.json /etc/xray/config.json
+
+# 复制 subconverter 配置文件
+COPY subconverter/config.ini /etc/subconverter/config.ini
+
+# 暴露端口（根据 xray-config.json 配置调整）
+EXPOSE 8080 25500
+
+# 启动脚本
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# 启动 Xray 和 subconverter
+CMD ["/entrypoint.sh"]
