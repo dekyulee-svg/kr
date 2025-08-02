@@ -4,6 +4,7 @@ import threading
 import struct
 from concurrent.futures import ThreadPoolExecutor
 import logging
+import os
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -15,7 +16,7 @@ class SOCKS5Proxy:
         self.port = port
         self.server_socket = None
         self.running = False
-        self.executor = ThreadPoolExecutor(max_workers=100)
+        self.executor = ThreadPoolExecutor(max_workers=50)
         
     def start_server(self):
         """启动SOCKS5代理服务器"""
@@ -23,7 +24,7 @@ class SOCKS5Proxy:
             self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.server_socket.bind((self.host, self.port))
-            self.server_socket.listen(100)
+            self.server_socket.listen(50)
             self.running = True
             
             logger.info(f"SOCKS5 代理服务器启动: {self.host}:{self.port}")
@@ -42,7 +43,7 @@ class SOCKS5Proxy:
     def handle_client(self, client_socket):
         """处理客户端连接"""
         try:
-            # SOCKS5 握手 - 支持无认证
+            # SOCKS5 握手
             if not self.socks5_handshake(client_socket):
                 client_socket.close()
                 return
@@ -61,9 +62,8 @@ class SOCKS5Proxy:
                 pass
             
     def socks5_handshake(self, client_socket):
-        """SOCKS5 握手过程 - 无需认证"""
+        """SOCKS5 握手过程"""
         try:
-            # 接收客户端握手请求
             data = client_socket.recv(256)
             if len(data) < 3:
                 return False
@@ -74,14 +74,12 @@ class SOCKS5Proxy:
                 
             methods = struct.unpack('!' + 'B' * nmethods, data[2:2+nmethods])
             
-            # 支持无认证方法 (0x00)
+            # 支持无认证 (0x00)
             if 0x00 in methods:
-                # 响应选择无认证
                 response = struct.pack('!BB', 5, 0x00)
                 client_socket.send(response)
                 return True
             else:
-                # 不支持的认证方法
                 response = struct.pack('!BB', 5, 0xFF)
                 client_socket.send(response)
                 return False
@@ -93,14 +91,13 @@ class SOCKS5Proxy:
     def handle_connect_request(self, client_socket):
         """处理连接请求"""
         try:
-            # 接收连接请求
             data = client_socket.recv(256)
             if len(data) < 10:
                 return False
                 
             version, cmd, reserved, address_type = struct.unpack('!BBBB', data[:4])
             
-            if version != 5 or cmd != 1:  # 只支持CONNECT命令
+            if version != 5 or cmd != 1:
                 self.send_error_response(client_socket, 0x07)
                 return False
                 
@@ -112,22 +109,19 @@ class SOCKS5Proxy:
                 domain_len = data[4]
                 target_host = data[5:5+domain_len].decode('utf-8')
                 target_port = struct.unpack('!H', data[5+domain_len:7+domain_len])[0]
-            elif address_type == 4:  # IPv6
-                target_host = socket.inet_ntop(socket.AF_INET6, data[4:20])
-                target_port = struct.unpack('!H', data[20:22])[0]
             else:
                 self.send_error_response(client_socket, 0x08)
                 return False
                 
             # 连接到目标服务器
             target_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            target_socket.settimeout(15)
+            target_socket.settimeout(10)
             
             try:
                 target_socket.connect((target_host, target_port))
                 
                 # 发送成功响应
-                response = struct.pack('!BBBB', 5, 0, 0, 1)  # IPv4
+                response = struct.pack('!BBBB', 5, 0, 0, 1)
                 response += socket.inet_aton('0.0.0.0')
                 response += struct.pack('!H', 0)
                 client_socket.send(response)
@@ -142,7 +136,6 @@ class SOCKS5Proxy:
                 return False
                 
         except Exception as e:
-            logger.error(f"处理连接请求时出错: {e}")
             return False
             
     def send_error_response(self, client_socket, error_code):
@@ -173,7 +166,6 @@ class SOCKS5Proxy:
                 except:
                     pass
                 
-        # 创建两个线程进行双向转发
         client_to_target = threading.Thread(target=forward, args=(client_socket, target_socket), daemon=True)
         target_to_client = threading.Thread(target=forward, args=(target_socket, client_socket), daemon=True)
         
@@ -183,24 +175,52 @@ class SOCKS5Proxy:
         client_to_target.join()
         target_to_client.join()
 
-# 自动启动 SOCKS5 服务器
-def auto_start_proxy():
-    """自动启动代理服务器"""
-    if 'proxy_server' not in st.session_state:
-        st.session_state.proxy_server = SOCKS5Proxy('0.0.0.0', 1080)
-        st.session_state.server_thread = threading.Thread(
-            target=st.session_state.proxy_server.start_server,
-            daemon=True
-        )
-        st.session_state.server_thread.start()
-        st.session_state.server_running = True
+# 启动代理服务器
+@st.cache_resource
+def start_proxy_server():
+    """启动并缓存代理服务器实例"""
+    try:
+        # 尝试多个端口
+        ports_to_try = [1080, 8080, 9050, 3128]
+        
+        for port in ports_to_try:
+            try:
+                proxy = SOCKS5Proxy('127.0.0.1', port)
+                server_thread = threading.Thread(target=proxy.start_server, daemon=True)
+                server_thread.start()
+                logger.info(f"SOCKS5 服务器成功启动在端口 {port}")
+                return proxy, port
+            except Exception as e:
+                logger.warning(f"端口 {port} 启动失败: {e}")
+                continue
+                
+        logger.error("所有端口都启动失败")
+        return None, None
+        
+    except Exception as e:
+        logger.error(f"启动代理服务器失败: {e}")
+        return None, None
 
 def main():
-    # 自动启动代理服务器
-    auto_start_proxy()
+    # 启动代理服务器
+    proxy_server, port = start_proxy_server()
     
-    # 空白页面
-    pass
+    # 隐藏 Streamlit 默认元素
+    hide_streamlit_style = """
+    <style>
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    header {visibility: hidden;}
+    .stApp > div {
+        padding: 0;
+        margin: 0;
+    }
+    </style>
+    """
+    st.markdown(hide_streamlit_style, unsafe_allow_html=True)
+    
+    # 完全隐藏内容
+    st.markdown('<div style="height: 1px;"></div>', unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
