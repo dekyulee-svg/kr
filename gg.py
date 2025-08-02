@@ -1,226 +1,262 @@
 import streamlit as st
 import socket
 import threading
-import struct
-from concurrent.futures import ThreadPoolExecutor
-import logging
-import os
+import time
+from datetime import datetime
+import queue
 
-# 配置日志
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-class SOCKS5Proxy:
-    def __init__(self, host='0.0.0.0', port=1080):
-        self.host = host
-        self.port = port
+class ProxyServer:
+    def __init__(self):
         self.server_socket = None
-        self.running = False
-        self.executor = ThreadPoolExecutor(max_workers=50)
+        self.is_running = False
+        self.connections = []
+        self.log_queue = queue.Queue()
         
-    def start_server(self):
-        """启动SOCKS5代理服务器"""
+    def log_message(self, message):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        log_entry = f"[{timestamp}] {message}"
+        self.log_queue.put(log_entry)
+        
+    def handle_client(self, client_socket, client_address):
         try:
-            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.server_socket.bind((self.host, self.port))
-            self.server_socket.listen(50)
-            self.running = True
+            request = client_socket.recv(1024)
+            self.log_message(f"Connection from {client_address}")
+            self.log_message(f"Request: {request[:100]}...")  # Log first 100 chars
             
-            logger.info(f"SOCKS5 代理服务器启动: {self.host}:{self.port}")
-            
-            while self.running:
-                try:
-                    client_socket, addr = self.server_socket.accept()
-                    self.executor.submit(self.handle_client, client_socket)
-                except Exception as e:
-                    if self.running:
-                        logger.error(f"接受连接时出错: {e}")
-                        
-        except Exception as e:
-            logger.error(f"启动服务器时出错: {e}")
-            
-    def handle_client(self, client_socket):
-        """处理客户端连接"""
-        try:
-            # SOCKS5 握手
-            if not self.socks5_handshake(client_socket):
-                client_socket.close()
+            if not request:
                 return
                 
-            # 处理连接请求
-            if not self.handle_connect_request(client_socket):
-                client_socket.close()
+            # Parse request
+            request_lines = request.split(b'\n')
+            if len(request_lines) == 0:
                 return
                 
+            first_line = request_lines[0].split()
+            if len(first_line) < 2:
+                return
+                
+            url = first_line[1]
+            
+            # Parse the URL to extract the host and port
+            http_pos = url.find(b'://')
+            if http_pos == -1:
+                temp = url
+            else:
+                temp = url[(http_pos+3):]
+                
+            port_pos = temp.find(b':')
+            webserver_pos = temp.find(b'/')
+            
+            if webserver_pos == -1:
+                webserver_pos = len(temp)
+                
+            webserver = ""
+            port = -1
+            
+            if (port_pos == -1 or webserver_pos < port_pos):
+                port = 80
+                webserver = temp[:webserver_pos]
+            else:
+                port = int((temp[(port_pos+1):])[:webserver_pos-port_pos-1])
+                webserver = temp[:port_pos]
+                
+            self.proxy_request(webserver, port, client_socket, request)
+            
         except Exception as e:
-            logger.error(f"处理客户端时出错: {e}")
+            self.log_message(f"Error handling client: {str(e)}")
         finally:
             try:
                 client_socket.close()
             except:
                 pass
-            
-    def socks5_handshake(self, client_socket):
-        """SOCKS5 握手过程"""
+                
+    def proxy_request(self, webserver, port, client_socket, request):
         try:
-            data = client_socket.recv(256)
-            if len(data) < 3:
-                return False
-                
-            version, nmethods = struct.unpack('!BB', data[:2])
-            if version != 5:
-                return False
-                
-            methods = struct.unpack('!' + 'B' * nmethods, data[2:2+nmethods])
+            self.log_message(f"Connecting to {webserver.decode()}:{port}")
+            proxy_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            proxy_socket.settimeout(10)  # Add timeout
+            proxy_socket.connect((webserver.decode(), port))
+            proxy_socket.send(request)
             
-            # 支持无认证 (0x00)
-            if 0x00 in methods:
-                response = struct.pack('!BB', 5, 0x00)
-                client_socket.send(response)
-                return True
-            else:
-                response = struct.pack('!BB', 5, 0xFF)
-                client_socket.send(response)
-                return False
-                
-        except Exception as e:
-            logger.error(f"握手过程出错: {e}")
-            return False
-            
-    def handle_connect_request(self, client_socket):
-        """处理连接请求"""
-        try:
-            data = client_socket.recv(256)
-            if len(data) < 10:
-                return False
-                
-            version, cmd, reserved, address_type = struct.unpack('!BBBB', data[:4])
-            
-            if version != 5 or cmd != 1:
-                self.send_error_response(client_socket, 0x07)
-                return False
-                
-            # 解析目标地址和端口
-            if address_type == 1:  # IPv4
-                target_host = socket.inet_ntoa(data[4:8])
-                target_port = struct.unpack('!H', data[8:10])[0]
-            elif address_type == 3:  # 域名
-                domain_len = data[4]
-                target_host = data[5:5+domain_len].decode('utf-8')
-                target_port = struct.unpack('!H', data[5+domain_len:7+domain_len])[0]
-            else:
-                self.send_error_response(client_socket, 0x08)
-                return False
-                
-            # 连接到目标服务器
-            target_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            target_socket.settimeout(10)
-            
-            try:
-                target_socket.connect((target_host, target_port))
-                
-                # 发送成功响应
-                response = struct.pack('!BBBB', 5, 0, 0, 1)
-                response += socket.inet_aton('0.0.0.0')
-                response += struct.pack('!H', 0)
-                client_socket.send(response)
-                
-                # 开始数据转发
-                self.relay_data(client_socket, target_socket)
-                return True
-                
-            except Exception as e:
-                self.send_error_response(client_socket, 0x05)
-                target_socket.close()
-                return False
-                
-        except Exception as e:
-            return False
-            
-    def send_error_response(self, client_socket, error_code):
-        """发送错误响应"""
-        try:
-            response = struct.pack('!BBBB', 5, error_code, 0, 1)
-            response += socket.inet_aton('0.0.0.0')
-            response += struct.pack('!H', 0)
-            client_socket.send(response)
-        except:
-            pass
-        
-    def relay_data(self, client_socket, target_socket):
-        """双向数据转发"""
-        def forward(source, destination):
-            try:
-                while True:
-                    data = source.recv(4096)
-                    if not data:
+            while True:
+                try:
+                    response = proxy_socket.recv(4096)
+                    if len(response) > 0:
+                        client_socket.send(response)
+                    else:
                         break
-                    destination.send(data)
+                except socket.timeout:
+                    break
+                except Exception as e:
+                    self.log_message(f"Error in proxy communication: {str(e)}")
+                    break
+                    
+            proxy_socket.close()
+            
+        except Exception as e:
+            self.log_message(f"Error in proxy request: {str(e)}")
+            
+    def start_server(self, host, port):
+        try:
+            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.server_socket.bind((host, port))
+            self.server_socket.listen(5)
+            self.server_socket.settimeout(1.0)  # Add timeout for accept()
+            
+            self.is_running = True
+            self.log_message(f"Proxy server started on {host}:{port}")
+            
+            while self.is_running:
+                try:
+                    client_socket, client_address = self.server_socket.accept()
+                    # Handle each client in a separate thread
+                    client_thread = threading.Thread(
+                        target=self.handle_client,
+                        args=(client_socket, client_address)
+                    )
+                    client_thread.daemon = True
+                    client_thread.start()
+                    
+                except socket.timeout:
+                    continue  # Check if still running
+                except Exception as e:
+                    if self.is_running:
+                        self.log_message(f"Server error: {str(e)}")
+                    break
+                    
+        except Exception as e:
+            self.log_message(f"Failed to start server: {str(e)}")
+        finally:
+            self.stop_server()
+            
+    def stop_server(self):
+        self.is_running = False
+        if self.server_socket:
+            try:
+                self.server_socket.close()
             except:
                 pass
-            finally:
-                try:
-                    source.close()
-                    destination.close()
-                except:
-                    pass
-                
-        client_to_target = threading.Thread(target=forward, args=(client_socket, target_socket), daemon=True)
-        target_to_client = threading.Thread(target=forward, args=(target_socket, client_socket), daemon=True)
-        
-        client_to_target.start()
-        target_to_client.start()
-        
-        client_to_target.join()
-        target_to_client.join()
+        self.log_message("Proxy server stopped")
 
-# 启动代理服务器
-@st.cache_resource
-def start_proxy_server():
-    """启动并缓存代理服务器实例"""
-    try:
-        # 尝试多个端口
-        ports_to_try = [1080, 8080, 9050, 3128]
-        
-        for port in ports_to_try:
+# Initialize session state
+if 'proxy_server' not in st.session_state:
+    st.session_state.proxy_server = ProxyServer()
+    st.session_state.server_thread = None
+    st.session_state.logs = []
+
+# Streamlit UI
+st.title("🌐 Proxy Server Manager")
+st.markdown("---")
+
+# Server Configuration
+col1, col2 = st.columns(2)
+
+with col1:
+    host = st.text_input("Host Address", value="127.0.0.1")
+    
+with col2:
+    port = st.number_input("Port", min_value=1, max_value=65535, value=8888)
+
+# Server Controls
+col1, col2, col3 = st.columns(3)
+
+with col1:
+    if st.button("🚀 Start Server", type="primary"):
+        if not st.session_state.proxy_server.is_running:
+            # Start server in a separate thread
+            st.session_state.server_thread = threading.Thread(
+                target=st.session_state.proxy_server.start_server,
+                args=(host, port)
+            )
+            st.session_state.server_thread.daemon = True
+            st.session_state.server_thread.start()
+            st.success(f"Starting proxy server on {host}:{port}")
+        else:
+            st.warning("Server is already running!")
+
+with col2:
+    if st.button("🛑 Stop Server", type="secondary"):
+        if st.session_state.proxy_server.is_running:
+            st.session_state.proxy_server.stop_server()
+            st.success("Server stopped")
+        else:
+            st.info("Server is not running")
+
+with col3:
+    if st.button("🗑️ Clear Logs"):
+        st.session_state.logs = []
+        # Clear the queue
+        while not st.session_state.proxy_server.log_queue.empty():
             try:
-                proxy = SOCKS5Proxy('127.0.0.1', port)
-                server_thread = threading.Thread(target=proxy.start_server, daemon=True)
-                server_thread.start()
-                logger.info(f"SOCKS5 服务器成功启动在端口 {port}")
-                return proxy, port
-            except Exception as e:
-                logger.warning(f"端口 {port} 启动失败: {e}")
-                continue
-                
-        logger.error("所有端口都启动失败")
-        return None, None
-        
-    except Exception as e:
-        logger.error(f"启动代理服务器失败: {e}")
-        return None, None
+                st.session_state.proxy_server.log_queue.get_nowait()
+            except queue.Empty:
+                break
 
-def main():
-    # 启动代理服务器
-    proxy_server, port = start_proxy_server()
-    
-    # 隐藏 Streamlit 默认元素
-    hide_streamlit_style = """
-    <style>
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
-    header {visibility: hidden;}
-    .stApp > div {
-        padding: 0;
-        margin: 0;
-    }
-    </style>
-    """
-    st.markdown(hide_streamlit_style, unsafe_allow_html=True)
-    
-    # 完全隐藏内容
-    st.markdown('<div style="height: 1px;"></div>', unsafe_allow_html=True)
+# Server Status
+st.markdown("---")
+status_col1, status_col2 = st.columns(2)
 
-if __name__ == "__main__":
-    main()
+with status_col1:
+    if st.session_state.proxy_server.is_running:
+        st.success("🟢 Server Status: Running")
+    else:
+        st.error("🔴 Server Status: Stopped")
+
+with status_col2:
+    st.info(f"📍 Address: {host}:{port}")
+
+# Configuration Instructions
+st.markdown("---")
+st.subheader("📋 How to Use")
+st.markdown("""
+1. **Start the Server**: Click "Start Server" to begin listening for connections
+2. **Configure Your Browser**: Set your browser's HTTP proxy to the address shown above
+3. **Browse the Web**: All HTTP requests will now go through this proxy server
+4. **Monitor Activity**: Watch the logs below to see real-time proxy activity
+
+**Proxy Settings:**
+- HTTP Proxy: `{host}:{port}`
+- HTTPS Proxy: Not supported (HTTP only)
+""".format(host=host, port=port))
+
+# Real-time Logs
+st.markdown("---")
+st.subheader("📊 Server Logs")
+
+# Get new log messages
+while not st.session_state.proxy_server.log_queue.empty():
+    try:
+        log_message = st.session_state.proxy_server.log_queue.get_nowait()
+        st.session_state.logs.append(log_message)
+    except queue.Empty:
+        break
+
+# Display logs
+log_container = st.container()
+with log_container:
+    if st.session_state.logs:
+        # Show last 50 log entries
+        recent_logs = st.session_state.logs[-50:]
+        for log in reversed(recent_logs):  # Show newest first
+            st.text(log)
+    else:
+        st.info("No logs yet. Start the server and make some requests to see activity.")
+
+# Auto-refresh
+if st.session_state.proxy_server.is_running:
+    time.sleep(1)
+    st.rerun()
+
+# Warning and Disclaimer
+st.markdown("---")
+st.warning("""
+⚠️ **Important Notes:**
+- This proxy server is for educational and testing purposes only
+- It only supports HTTP traffic (not HTTPS)
+- Use responsibly and in compliance with applicable laws
+- The server runs on the same machine as this Streamlit app
+""")
+
+st.markdown("---")
+st.markdown("*Built with Streamlit*")
